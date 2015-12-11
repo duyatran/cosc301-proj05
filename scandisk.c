@@ -16,7 +16,8 @@
 #include "dos.h"
 
 void write_dirent(struct direntry *dirent, char *filename, 
-		  uint16_t start_cluster, uint32_t size)
+		  uint16_t start_cluster, int *used_clusters, 
+		  uint8_t *image_buf, struct bpb33* bpb)
 {
     char *p, *p2;
     char *uppername;
@@ -66,17 +67,30 @@ void write_dirent(struct direntry *dirent, char *filename,
     memcpy(dirent->deName, uppername, strlen(uppername));
     free(p2);
 
+	uint16_t cluster = start_cluster;
+	int count = 0;
+	printf("Orphan, starting cluster %d\n", start_cluster);
+
+    while (is_valid_cluster(cluster, bpb) && !is_end_of_file(cluster))
+    {
+		printf("Another block in this orphan file: %d\n", cluster);
+		count++;
+		used_clusters[cluster] = 1;
+		cluster = get_fat_entry(cluster, image_buf, bpb);
+    }
+	int size = count * (bpb->bpbBytesPerSec) * (bpb->bpbSecPerClust);
     /* set the attributes and file size */
     dirent->deAttributes = ATTR_NORMAL;
     putushort(dirent->deStartCluster, start_cluster);
     putulong(dirent->deFileSize, size);
+	
 
     /* could also set time and date here if we really
        cared... */
 }
 
 void create_dirent(struct direntry *dirent, char *filename, 
-		   uint16_t start_cluster, uint32_t size,
+		   uint16_t start_cluster, int *used_clusters,
 		   uint8_t *image_buf, struct bpb33* bpb)
 {
     while (1) 
@@ -84,7 +98,7 @@ void create_dirent(struct direntry *dirent, char *filename,
 	if (dirent->deName[0] == SLOT_EMPTY) 
 	{
 	    /* we found an empty slot at the end of the directory */
-	    write_dirent(dirent, filename, start_cluster, size);
+	    write_dirent(dirent, filename, start_cluster, used_clusters, image_buf, bpb);
 	    dirent++;
 
 	    /* make sure the next dirent is set to be empty, just in
@@ -97,7 +111,7 @@ void create_dirent(struct direntry *dirent, char *filename,
 	if (dirent->deName[0] == SLOT_DELETED) 
 	{
 	    /* we found a deleted entry - we can just overwrite it */
-	    write_dirent(dirent, filename, start_cluster, size);
+	    write_dirent(dirent, filename, start_cluster, used_clusters, image_buf, bpb);
 	    return;
 	}
 	dirent++;
@@ -108,12 +122,19 @@ uint16_t clusters_len(uint16_t cluster,
 			uint8_t *image_buf, struct bpb33 *bpb, int *used_sectors) 
 {
 	int len = 0;
-
+	uint16_t current = 0;
     while (is_valid_cluster(cluster, bpb) && !is_end_of_file(cluster))
     {
 		len++;
 		used_sectors[cluster] = 1;
+		current = cluster;
 		cluster = get_fat_entry(cluster, image_buf, bpb);
+
+		if (current == (FAT12_MASK&CLUST_BAD)) {
+			printf("Bad cluster, number %d\n", current);
+			set_fat_entry(current, FAT12_MASK&CLUST_EOFS, image_buf, bpb);
+			return len;
+		}
     }
     return len;
 }
@@ -271,6 +292,7 @@ uint16_t read_dirent(struct direntry *dirent, int indent,
 				   sys?'s':' ', 
 				   arch?'a':' ');
 		if (check_inconsistency(dirent, image_buf, bpb, used_clusters)) {
+			printf("Some inconsistency with the file above\n");
 			fix_sz(dirent, image_buf, bpb);
 		}
 	}	
@@ -317,7 +339,7 @@ void traverse_root(uint8_t *image_buf, struct bpb33* bpb,
 void find_orphans(uint8_t *image_buf, 
 		struct bpb33* bpb, int *used_clusters) 
 {
-	struct direntry *root_dir = (struct direntry*)cluster_to_addr(0, image_buf, bpb);
+	struct direntry *root_dir = (struct direntry*)cluster_to_addr(MSDOSFSROOT, image_buf, bpb);
 	char orphan_name[64];
 	int count = 0;
 	int i = 0;
@@ -327,18 +349,23 @@ void find_orphans(uint8_t *image_buf,
 		start_clusters[i] = 1;
 	}
 	
+	// A start-of-file cluster will is not linked to 
+	// by any other cluster, and its value in the start_clusters 
+	// array will remain 1.
 	for (i = CLUST_FIRST; i < bpb->bpbSectors; i++) {
 		uint16_t ref = get_fat_entry(i, image_buf, bpb);
 		start_clusters[ref] = 0; 
 	}
 	
     for (i = CLUST_FIRST; i < bpb->bpbSectors; i++) {
-		if (used_clusters[i] == 0 && get_fat_entry(i, image_buf, bpb) 
-				&& start_clusters[i] == 1) {
+		if ((used_clusters[i] == 0)
+			&& (get_fat_entry(i, image_buf, bpb) != (FAT12_MASK&CLUST_FREE))
+			&& (start_clusters[i] == 1))
+		{	
 			count++;
 			snprintf(orphan_name, 64, "found%d.dat", count);
-			//create_dirent(root_dir, orphan_name, used_clusters[i], 
-					//size, image_buf, bpb);
+			create_dirent(root_dir, orphan_name, i, 
+					used_clusters, image_buf, bpb);
 		}
 	}
 }
