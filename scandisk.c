@@ -73,7 +73,7 @@ void write_dirent(struct direntry *dirent, char *filename,
 
     while (is_valid_cluster(cluster, bpb) && !is_end_of_file(cluster))
     {
-		printf("Another block in this orphan file: %d\n", cluster);
+		//printf("Another block in this orphan file: %d\n", cluster);
 		count++;
 		used_clusters[cluster] = 1;
 		cluster = get_fat_entry(cluster, image_buf, bpb);
@@ -122,19 +122,21 @@ uint16_t clusters_len(uint16_t cluster,
 			uint8_t *image_buf, struct bpb33 *bpb, int *used_sectors) 
 {
 	int len = 0;
-	uint16_t current = 0;
+	uint16_t next_cluster = 0;
+
     while (is_valid_cluster(cluster, bpb) && !is_end_of_file(cluster))
     {
 		len++;
 		used_sectors[cluster] = 1;
-		current = cluster;
-		cluster = get_fat_entry(cluster, image_buf, bpb);
+		next_cluster = get_fat_entry(cluster, image_buf, bpb);
 
-		if (current == (FAT12_MASK&CLUST_BAD)) {
-			printf("Bad cluster, number %d\n", current);
-			set_fat_entry(current, FAT12_MASK&CLUST_EOFS, image_buf, bpb);
+		if (cluster == (FAT12_MASK&CLUST_BAD) 
+			|| cluster == next_cluster
+			|| !is_valid_cluster(next_cluster, bpb)) {
+			set_fat_entry(cluster, FAT12_MASK&CLUST_EOFS, image_buf, bpb);
 			return len;
 		}
+		cluster = next_cluster;
     }
     return len;
 }
@@ -178,21 +180,22 @@ void fix_sz(struct direntry *dirent,
 int check_inconsistency(struct direntry *dirent, uint8_t *image_buf, 
 			struct bpb33* bpb, int *used_sectors) {
 	
-		uint16_t start_cluster = getushort(dirent->deStartCluster);
-		uint32_t dirent_sz = getulong(dirent->deFileSize);
-		uint16_t cluster_size = bpb->bpbBytesPerSec * bpb->bpbSecPerClust;
+	uint16_t start_cluster = getushort(dirent->deStartCluster);
+	uint32_t dirent_sz = getulong(dirent->deFileSize);
+	uint16_t cluster_size = bpb->bpbBytesPerSec * bpb->bpbSecPerClust;
 
-		uint16_t metadata_len = (dirent_sz + cluster_size - 1)/cluster_size;
-		uint16_t cluster_len = clusters_len(start_cluster, image_buf, bpb, used_sectors);
+	uint16_t metadata_len = (dirent_sz + cluster_size - 1)/cluster_size;
+	uint16_t cluster_len = clusters_len(start_cluster, image_buf, bpb, used_sectors);
 
-		printf("start cluster is %d blocks\n", start_cluster);
-		printf("metadata_size is %d blocks\n", metadata_len);
-		printf("cluster_chain is %d blocks\n", cluster_len);
+	printf("start cluster is %d blocks\n", start_cluster);
+	printf("metadata_size is %d blocks\n", metadata_len);
+	printf("cluster_chain is %d blocks\n", cluster_len);
 
-		if (metadata_len != cluster_len) {
-			return 1;
-		}
-		return 0;
+	if (metadata_len != cluster_len) {
+		return 1;
+	}
+
+	return 0;
 }
 
 void print_indent(int indent)
@@ -200,6 +203,16 @@ void print_indent(int indent)
     int i;
     for (i = 0; i < indent*4; i++)
 	printf(" ");
+}
+
+int check_fix_invalid_file(struct direntry *dirent, struct bpb33* bpb) {
+    uint16_t start_cluster = getushort(dirent->deStartCluster);
+	if (!is_valid_cluster(start_cluster, bpb)) {
+		memset(dirent, 0, sizeof(struct direntry));
+		dirent->deName[0] = SLOT_EMPTY;
+		return 0;
+	}
+	return 1;
 }
 
 uint16_t read_dirent(struct direntry *dirent, int indent, 
@@ -291,7 +304,9 @@ uint16_t read_dirent(struct direntry *dirent, int indent,
 				   hidden?'h':' ', 
 				   sys?'s':' ', 
 				   arch?'a':' ');
-		if (check_inconsistency(dirent, image_buf, bpb, used_clusters)) {
+				   
+		int valid = check_fix_invalid_file(dirent, bpb);
+		if (valid && check_inconsistency(dirent, image_buf, bpb, used_clusters)) {
 			printf("Some inconsistency with the file above\n");
 			fix_sz(dirent, image_buf, bpb);
 		}
