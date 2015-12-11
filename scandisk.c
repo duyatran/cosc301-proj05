@@ -69,16 +69,16 @@ void write_dirent(struct direntry *dirent, char *filename,
 
 	uint16_t cluster = start_cluster;
 	int count = 0;
-	printf("Orphan, starting cluster %d\n", start_cluster);
 
     while (is_valid_cluster(cluster, bpb) && !is_end_of_file(cluster))
     {
-		//printf("Another block in this orphan file: %d\n", cluster);
 		count++;
 		used_clusters[cluster] = 1;
 		cluster = get_fat_entry(cluster, image_buf, bpb);
     }
 	int size = count * (bpb->bpbBytesPerSec) * (bpb->bpbSecPerClust);
+	printf("Making an orphan file, starting cluster %d, size %d\n", start_cluster, size);
+
     /* set the attributes and file size */
     dirent->deAttributes = ATTR_NORMAL;
     putushort(dirent->deStartCluster, start_cluster);
@@ -131,8 +131,9 @@ uint16_t clusters_len(uint16_t cluster,
 		next_cluster = get_fat_entry(cluster, image_buf, bpb);
 
 		if (cluster == (FAT12_MASK&CLUST_BAD) 
-			|| cluster == next_cluster
-			|| !is_valid_cluster(next_cluster, bpb)) {
+			|| cluster == next_cluster) {
+			printf("Either cluster %d might be bad or self-referencing.", cluster);
+			printf("Anyway, the file will end at this block.");
 			set_fat_entry(cluster, FAT12_MASK&CLUST_EOFS, image_buf, bpb);
 			return len;
 		}
@@ -171,7 +172,7 @@ void fix_sz(struct direntry *dirent,
 	uint16_t last_fat_cluster = count + getushort(dirent->deStartCluster) - 1;
 
 	if (last_metadata_cluster > last_fat_cluster) {
-		uint32_t change = (cluster_size * (last_fat_cluster-last_metadata_cluster));
+		uint32_t change = (cluster_size * (last_fat_cluster-last_metadata_cluster));		
 		dirent_size += change;
 		putulong(dirent->deFileSize, dirent_size);
 	}
@@ -187,11 +188,9 @@ int check_inconsistency(struct direntry *dirent, uint8_t *image_buf,
 	uint16_t metadata_len = (dirent_sz + cluster_size - 1)/cluster_size;
 	uint16_t cluster_len = clusters_len(start_cluster, image_buf, bpb, used_sectors);
 
-	printf("start cluster is %d blocks\n", start_cluster);
-	printf("metadata_size is %d blocks\n", metadata_len);
-	printf("cluster_chain is %d blocks\n", cluster_len);
-
 	if (metadata_len != cluster_len) {
+		printf("metadata size: %d\n", metadata_len);
+		printf("cluster chain size: %d\n", cluster_len);
 		return 1;
 	}
 
@@ -281,6 +280,9 @@ uint16_t read_dirent(struct direntry *dirent, int indent,
         // don't deal with hidden directories; MacOS makes these
         // for trash directories and such; just ignore them.
 		if ((dirent->deAttributes & ATTR_HIDDEN) != ATTR_HIDDEN) {
+			print_indent(indent);
+    	    printf("%s/ (directory)\n", name);
+
 		    file_cluster = getushort(dirent->deStartCluster);
             followclust = file_cluster;
 			used_clusters[followclust] = 1;
@@ -307,7 +309,6 @@ uint16_t read_dirent(struct direntry *dirent, int indent,
 				   
 		int valid = check_fix_invalid_file(dirent, bpb);
 		if (valid && check_inconsistency(dirent, image_buf, bpb, used_clusters)) {
-			printf("Some inconsistency with the file above\n");
 			fix_sz(dirent, image_buf, bpb);
 		}
 	}	
@@ -323,7 +324,7 @@ void follow_dir(uint16_t cluster, int indent,
         int numDirEntries = (bpb->bpbBytesPerSec * bpb->bpbSecPerClust) / sizeof(struct direntry);
         int i = 0;
 		for ( ; i < numDirEntries; i++) {
-			uint16_t followclust = read_dirent(dirent, 0, image_buf, bpb, used_clusters);
+			uint16_t followclust = read_dirent(dirent, indent, image_buf, bpb, used_clusters);
 			if (followclust)
 				follow_dir(followclust, indent+1, image_buf, bpb, used_clusters);
 			dirent++;
