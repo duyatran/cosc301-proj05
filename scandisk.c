@@ -7,62 +7,171 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <string.h>
+#include <ctype.h>
 
 #include "bootsect.h"
 #include "bpb.h"
 #include "direntry.h"
 #include "fat.h"
 #include "dos.h"
-#define NO_PRINT 0
-#define PRINT 1
 
-int dirent_clusters(struct direntry *dirent, struct bpb33 *bpb) 
+void write_dirent(struct direntry *dirent, char *filename, 
+		  uint16_t start_cluster, uint32_t size)
 {
-	uint32_t dirent_sz = getulong(dirent->deFileSize);
+    char *p, *p2;
+    char *uppername;
+    int len, i;
+
+    /* clean out anything old that used to be here */
+    memset(dirent, 0, sizeof(struct direntry));
+
+    /* extract just the filename part */
+    uppername = strdup(filename);
+    p2 = uppername;
+    for (i = 0; i < strlen(filename); i++) 
+    {
+	if (p2[i] == '/' || p2[i] == '\\') 
+	{
+	    uppername = p2+i+1;
+	}
+    }
+
+    /* convert filename to upper case */
+    for (i = 0; i < strlen(uppername); i++) 
+    {
+	uppername[i] = toupper(uppername[i]);
+    }
+
+    /* set the file name and extension */
+    memset(dirent->deName, ' ', 8);
+    p = strchr(uppername, '.');
+    memcpy(dirent->deExtension, "___", 3);
+    if (p == NULL) 
+    {
+	fprintf(stderr, "No filename extension given - defaulting to .___\n");
+    }
+    else 
+    {
+	*p = '\0';
+	p++;
+	len = strlen(p);
+	if (len > 3) len = 3;
+	memcpy(dirent->deExtension, p, len);
+    }
+
+    if (strlen(uppername)>8) 
+    {
+	uppername[8]='\0';
+    }
+    memcpy(dirent->deName, uppername, strlen(uppername));
+    free(p2);
+
+    /* set the attributes and file size */
+    dirent->deAttributes = ATTR_NORMAL;
+    putushort(dirent->deStartCluster, start_cluster);
+    putulong(dirent->deFileSize, size);
+
+    /* could also set time and date here if we really
+       cared... */
+}
+
+void create_dirent(struct direntry *dirent, char *filename, 
+		   uint16_t start_cluster, uint32_t size,
+		   uint8_t *image_buf, struct bpb33* bpb)
+{
+    while (1) 
+    {
+	if (dirent->deName[0] == SLOT_EMPTY) 
+	{
+	    /* we found an empty slot at the end of the directory */
+	    write_dirent(dirent, filename, start_cluster, size);
+	    dirent++;
+
+	    /* make sure the next dirent is set to be empty, just in
+	       case it wasn't before */
+	    memset((uint8_t*)dirent, 0, sizeof(struct direntry));
+	    dirent->deName[0] = SLOT_EMPTY;
+	    return;
+	}
+
+	if (dirent->deName[0] == SLOT_DELETED) 
+	{
+	    /* we found a deleted entry - we can just overwrite it */
+	    write_dirent(dirent, filename, start_cluster, size);
+	    return;
+	}
+	dirent++;
+    }
+}
+
+uint16_t clusters_len(uint16_t cluster, 
+			uint8_t *image_buf, struct bpb33 *bpb, int *used_sectors) 
+{
+	int len = 0;
+
+    while (is_valid_cluster(cluster, bpb) && !is_end_of_file(cluster))
+    {
+		len++;
+		used_sectors[cluster] = 1;
+		cluster = get_fat_entry(cluster, image_buf, bpb);
+    }
+    return len;
+}
+
+void fix_sz(struct direntry *dirent,
+		uint8_t *image_buf, struct bpb33* bpb) 
+{	
+	uint16_t current = getushort(dirent->deStartCluster);
+	uint32_t dirent_size = getulong(dirent->deFileSize);
 	uint16_t cluster_size = bpb->bpbBytesPerSec * bpb->bpbSecPerClust;
 
-	int num_blocks = dirent_sz/cluster_size;
-	if (dirent_sz % cluster_size != 0) {
-		num_blocks++;
+	uint16_t next;
+	
+	int metadata_len = (dirent_size + cluster_size - 1)/cluster_size;
+	uint16_t last_metadata_cluster = metadata_len + current - 1;
+
+	int count = 0;
+	while (is_valid_cluster(current, bpb)) {
+		next = get_fat_entry(current, image_buf, bpb);
+		count++;
+		if (current == last_metadata_cluster) {
+			set_fat_entry(current, FAT12_MASK&CLUST_EOFS, image_buf, bpb);
+		}
+		else if (current > last_metadata_cluster) {
+			set_fat_entry(current, FAT12_MASK&CLUST_FREE, image_buf, bpb);
+		}
+        if (is_end_of_file(next)) {
+            break;
+        }
+        current = next;
 	}
-	return num_blocks;
+	uint16_t last_fat_cluster = count + getushort(dirent->deStartCluster) - 1;
+
+	if (last_metadata_cluster > last_fat_cluster) {
+		uint32_t change = (cluster_size * (last_fat_cluster-last_metadata_cluster));
+		dirent_size += change;
+		putulong(dirent->deFileSize, dirent_size);
+	}
 }
 
-int chain_length(struct direntry *dirent, uint8_t *image_buf, struct bpb33 *bpb) 
-{
-    uint16_t cluster = getushort(dirent->deStartCluster);
-	int count = 0;
+int check_inconsistency(struct direntry *dirent, uint8_t *image_buf, 
+			struct bpb33* bpb, int *used_sectors) {
+	
+		uint16_t start_cluster = getushort(dirent->deStartCluster);
+		uint32_t dirent_sz = getulong(dirent->deFileSize);
+		uint16_t cluster_size = bpb->bpbBytesPerSec * bpb->bpbSecPerClust;
 
-    while (is_valid_cluster(cluster, bpb))
-    {
-		count++;
-		// break if current cluster is eof
-        if (is_end_of_file(cluster)) {
-			break;
+		uint16_t metadata_len = (dirent_sz + cluster_size - 1)/cluster_size;
+		uint16_t cluster_len = clusters_len(start_cluster, image_buf, bpb, used_sectors);
+
+		printf("start cluster is %d blocks\n", start_cluster);
+		printf("metadata_size is %d blocks\n", metadata_len);
+		printf("cluster_chain is %d blocks\n", cluster_len);
+
+		if (metadata_len != cluster_len) {
+			return 1;
 		}
-		cluster = get_fat_entry(cluster, image_buf, bpb);
-    }
-    return count;
-}
-
-void fix_file_size(struct direntry *dirent, 
-		uint8_t *image_buf, struct bpb33* bpb, int meta_sz, int chain_sz) 
-{	
-	int count = 0;
-	uint16_t cluster = getushort(dirent->deStartCluster);
-	uint16_t end_cluster;
-
-    while (is_valid_cluster(cluster, bpb)) {
-		count++;
-		if (count == meta_sz) {
-			end_cluster = cluster;
-		}
-		if (count > meta_sz) {
-			set_fat_entry(cluster, CLUST_FREE, image_buf, bpb);
-		}	
-		cluster = get_fat_entry(cluster, image_buf, bpb);
-    }
-    set_fat_entry(end_cluster, FAT12_MASK&CLUST_EOFS, image_buf, bpb);
+		return 0;
 }
 
 void print_indent(int indent)
@@ -72,7 +181,8 @@ void print_indent(int indent)
 	printf(" ");
 }
 
-uint16_t read_dirent(struct direntry *dirent, int indent, int print_flag)
+uint16_t read_dirent(struct direntry *dirent, int indent, 
+			uint8_t *image_buf, struct bpb33* bpb, int *used_clusters)
 {
 	uint16_t followclust = 0;
 
@@ -128,7 +238,7 @@ uint16_t read_dirent(struct direntry *dirent, int indent, int print_flag)
 	//
 	// printf("Win95 long-filename entry seq 0x%0x\n", dirent->deName[0]);
     }
-    else if (print_flag && (dirent->deAttributes & ATTR_VOLUME) != 0) 
+    else if ((dirent->deAttributes & ATTR_VOLUME) != 0) 
     {
 		printf("Volume: %s\n", name);
     } 
@@ -139,87 +249,98 @@ uint16_t read_dirent(struct direntry *dirent, int indent, int print_flag)
 		if ((dirent->deAttributes & ATTR_HIDDEN) != ATTR_HIDDEN) {
 		    file_cluster = getushort(dirent->deStartCluster);
             followclust = file_cluster;
-			if (print_flag) {
-				print_indent(indent);
-				printf("%s/ (directory)\n", name);
-			}
+			used_clusters[followclust] = 1;
 		}
     }
-    else if (print_flag)
-    {
-        /*
-         * a "regular" file entry
-         * print attributes, size, starting cluster, etc.
-         */
-	int ro = (dirent->deAttributes & ATTR_READONLY) == ATTR_READONLY;
-	int hidden = (dirent->deAttributes & ATTR_HIDDEN) == ATTR_HIDDEN;
-	int sys = (dirent->deAttributes & ATTR_SYSTEM) == ATTR_SYSTEM;
-	int arch = (dirent->deAttributes & ATTR_ARCHIVE) == ATTR_ARCHIVE;
+    else {
+		/*
+		 * a "regular" file entry
+		 * print attributes, size, starting cluster, etc.
+		 */
+		int ro = (dirent->deAttributes & ATTR_READONLY) == ATTR_READONLY;
+		int hidden = (dirent->deAttributes & ATTR_HIDDEN) == ATTR_HIDDEN;
+		int sys = (dirent->deAttributes & ATTR_SYSTEM) == ATTR_SYSTEM;
+		int arch = (dirent->deAttributes & ATTR_ARCHIVE) == ATTR_ARCHIVE;
 
-	size = getulong(dirent->deFileSize);
-	print_indent(indent);
-	printf("%s.%s (%u bytes) (starting cluster %d) %c%c%c%c\n", 
-	       name, extension, size, getushort(dirent->deStartCluster),
-	       ro?'r':' ', 
-               hidden?'h':' ', 
-               sys?'s':' ', 
-               arch?'a':' ');
-    }
+		size = getulong(dirent->deFileSize);
+		print_indent(indent);
+		printf("%s.%s (%u bytes) (starting cluster %d) %c%c%c%c\n", 
+			   name, extension, size, getushort(dirent->deStartCluster),
+			   ro?'r':' ', 
+				   hidden?'h':' ', 
+				   sys?'s':' ', 
+				   arch?'a':' ');
+		if (check_inconsistency(dirent, image_buf, bpb, used_clusters)) {
+			fix_sz(dirent, image_buf, bpb);
+		}
+	}	
     return followclust;
 }
 
 void follow_dir(uint16_t cluster, int indent,
-		uint8_t *image_buf, struct bpb33* bpb, int *sz_err)
-{
-    while (is_valid_cluster(cluster, bpb))
-    {
+		uint8_t *image_buf, struct bpb33* bpb, int *used_clusters) {
+    
+    while (is_valid_cluster(cluster, bpb)) {
         struct direntry *dirent = (struct direntry*)cluster_to_addr(cluster, image_buf, bpb);
 
         int numDirEntries = (bpb->bpbBytesPerSec * bpb->bpbSecPerClust) / sizeof(struct direntry);
         int i = 0;
-	for ( ; i < numDirEntries; i++)
-	{
-			uint16_t followclust = read_dirent(dirent, 0, NO_PRINT);
-            int metadata_size = dirent_clusters(dirent, bpb);
-            int cluster_chain = chain_length(dirent, image_buf, bpb);
-            
-            if ((metadata_size != cluster_chain) && 
-				(dirent->deAttributes & ATTR_DIRECTORY) == 0) {
-				*sz_err = 1;
-				read_dirent(dirent, indent, PRINT);
-				//fix_file_size(dirent, image_buf, bpb, metadata_size, cluster_chain);
-				printf("metadata_size is %d blocks\n", dirent_clusters(dirent, bpb));
-				printf("cluster_chain is %d blocks\n", chain_length(dirent, image_buf, bpb));
-			}
-            
-            if (followclust)
-                follow_dir(followclust, indent+1, image_buf, bpb, sz_err);
-            dirent++;
-	}
+		for ( ; i < numDirEntries; i++) {
+			uint16_t followclust = read_dirent(dirent, 0, image_buf, bpb, used_clusters);
+			if (followclust)
+				follow_dir(followclust, indent+1, image_buf, bpb, used_clusters);
+			dirent++;
+		}
 
 	cluster = get_fat_entry(cluster, image_buf, bpb);
     }
 }
 
 
-void check_size_consistency(uint8_t *image_buf, struct bpb33* bpb)
+void traverse_root(uint8_t *image_buf, struct bpb33* bpb,
+					int *used_clusters)
 {
     uint16_t cluster = 0;
-	int rv = 0;
     struct direntry *dirent = (struct direntry*)cluster_to_addr(cluster, image_buf, bpb);
-
     int i = 0;
-    printf("Files whose metadata size is different from chain size:\n");
 
     for ( ; i < bpb->bpbRootDirEnts; i++)
     {
-        uint16_t followclust = read_dirent(dirent, 0, NO_PRINT);
+        uint16_t followclust = read_dirent(dirent, 0, image_buf, bpb, used_clusters);
         if (is_valid_cluster(followclust, bpb)) {
-            follow_dir(followclust, 1, image_buf, bpb, &rv);
+            follow_dir(followclust, 1, image_buf, bpb, used_clusters);
 		}
         dirent++;
     }
-    if (!rv) printf("No size inconsistency.\n");
+}
+
+void find_orphans(uint8_t *image_buf, 
+		struct bpb33* bpb, int *used_clusters) 
+{
+	struct direntry *root_dir = (struct direntry*)cluster_to_addr(0, image_buf, bpb);
+	char orphan_name[64];
+	int count = 0;
+	int i = 0;
+	int start_clusters[bpb->bpbSectors];
+	
+	for (; i < bpb->bpbSectors; i++) {
+		start_clusters[i] = 1;
+	}
+	
+	for (i = CLUST_FIRST; i < bpb->bpbSectors; i++) {
+		uint16_t ref = get_fat_entry(i, image_buf, bpb);
+		start_clusters[ref] = 0; 
+	}
+	
+    for (i = CLUST_FIRST; i < bpb->bpbSectors; i++) {
+		if (used_clusters[i] == 0 && get_fat_entry(i, image_buf, bpb) 
+				&& start_clusters[i] == 1) {
+			count++;
+			snprintf(orphan_name, 64, "found%d.dat", count);
+			//create_dirent(root_dir, orphan_name, used_clusters[i], 
+					//size, image_buf, bpb);
+		}
+	}
 }
 
 void usage(char *progname) {
@@ -240,10 +361,12 @@ int main(int argc, char** argv) {
     bpb = check_bootsector(image_buf);
 
     // your code should start here...
-	check_size_consistency(image_buf, bpb);
-
-
-
+    int used_clusters[bpb->bpbSectors];
+    for (int i = 0; i < bpb->bpbSectors; i++) {
+		used_clusters[i] = 0;
+	}
+	traverse_root(image_buf, bpb, used_clusters);
+	find_orphans(image_buf, bpb, used_clusters);
 
 
     unmmap_file(image_buf, &fd);
